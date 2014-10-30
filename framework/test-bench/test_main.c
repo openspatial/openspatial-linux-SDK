@@ -1,8 +1,12 @@
 /*
  * Copyright 2014, Nod Labs
  *
- * This is main file of the test framework, which can be used as a farm test
- * of the devices
+ * This is main file of the test framework. The following functionalities are
+ * implemented:
+ * - Read services from the device
+ * - Read characteristics from the device
+ * - Enable/Disable notifications
+ * - Receive the data from the device
  */
 #include <stdio.h>
 #include <errno.h>
@@ -35,13 +39,19 @@
 #define ERR_SEC_LEVEL       0xfc
 #define ERR_PROTOCOL        0xfb
 #define ERR_MTU             0xfa
-#define SEC_LEVEL           "high"    /* we need this level for enabling the HID notifications. But this can lead to
-                                       * closure of the iochannel handler
-                                       */
 #define CHAR_START          0x0001
 #define CHAR_END            0x00FF
 #define ENABLE_NOTIFICATION   "01 00"
 #define DISABLE_NOTIFICATION  "00 00"
+
+#define GET_SZ(a) (sizeof(a)/sizeof(a[0]))
+
+enum {
+  TTM_MODE      = 0,
+  GAME_MODE     = 1,
+  POSE6D_MODE   = 2,
+  POINTER_MODE  = 3,
+};
 
 struct items {
   guint8 error_num;
@@ -60,7 +70,7 @@ static enum state {
 } conn_state;
 
 enum write_type {
-  WRITE_COMMAND,    /* write without response */
+  WRITE_COMMAND,    /* write w/o response */
   WRITE_REQUEST,    /* write with response */
 };
 
@@ -90,16 +100,24 @@ static enum state get_state(void)
   return conn_state;
 }
 
+static void change_mode(gpointer data, int mode);
+
 static void signal_handler(int sig)
 {
-  printf("\nHandling the interrupt...\n");
   /* some error caused user to hit ^C */
-  if (get_state() == STATE_SCANNING)
+  if (get_state() == STATE_SCANNING) {
     finish_scanning = 1;
-  else if(get_state() == STATE_DATARCVD)
-    g_main_loop_quit(event_loop);
-  else
+  } else if(get_state() == STATE_DATARCVD) {
+    /* set the mode to TTM_MODE */
+    change_mode((gpointer)attrib, TTM_MODE);
+    /* wait for the write to finish */
+    sleep(1);
+    /* exit the looper */
+    g_main_loop_quit(event_loop);;
+  } else {
+    /* exit this app */
     exit(-1);
+  }
 
   return;
 }
@@ -154,6 +172,9 @@ static void events_handler(const uint8_t *pdu, uint16_t len, gpointer user_data)
         return;
     }
 
+    /* For now, dump the binary packet received. Logic can be added here to
+     * transfer this data to another process
+     */
     for (i = 3; i < len; i++)
       printf("%02x ", pdu[i]);
     printf("\n");
@@ -277,7 +298,7 @@ static int cmd_lescan(int dev_id)
           continue;
        /* anything else, just end the loop */
        goto done;
-    } 
+    }
 
      ptr = buf + (1 + HCI_EVENT_HDR_SIZE);
      len -= (1 + HCI_EVENT_HDR_SIZE);
@@ -288,7 +309,7 @@ static int cmd_lescan(int dev_id)
       goto done;
 
      info = (le_advertising_info *) (meta->data + 1);
-    
+
      memset(addr, 0, sizeof(addr));
 
      address2string(&info->bdaddr, addr);
@@ -344,8 +365,8 @@ static void discover_services_cb(GSList *services, guint8 status, gpointer user_
     for (l = services; l; l = l->next) {
       struct gatt_primary *prim = l->data;
       printf("start handle: 0x%04x end handle: 0x%04x uuid: %s\n", prim->range.start, prim->range.end, prim->uuid);
-    }    
-    
+    }
+
 done:
     g_main_loop_quit(event_loop);
 }
@@ -373,7 +394,7 @@ static int discover_services(gpointer data)
     if (get_state() != STATE_CONNECTED) {
       printf("device is already disconnected\n");
       return -1;
-    }    
+    }
     gatt_discover_primary(attrib, NULL, discover_services_cb, NULL);
     g_main_loop_run(event_loop);
     return 0;
@@ -415,7 +436,7 @@ static int cmd_connect(const char *dst, gpointer user_data)
 
   /* iochannel is declared global for now
    * source: src/device.c in bluez tree for more details
-   */ 
+   */
   iochannel = bt_io_connect(connect_cb, user_data, NULL, &gerr,
               BT_IO_OPT_SOURCE_BDADDR, &sba,
               BT_IO_OPT_SOURCE_TYPE, BDADDR_LE_PUBLIC,
@@ -457,16 +478,17 @@ static int strtohandle(const char *src)
   return dst;
 }
 
-static int cmd_char_write(gpointer user_data, const char *handle, const char* data, enum write_type type)
+static int cmd_char_write(gpointer user_data, const char *handle, const char* data, int type)
 {
     GAttrib *attrib = user_data;
     uint8_t *value;
     size_t len;
     int hdl, ret;
 
-    printf("handle = %s, data = %s, type = %d\n", handle, data, type);
-
-    if (get_state() != STATE_CONNECTED) {
+    /* we need to enable notifications very early, as well change mode
+     * when we receive an exception to quit
+     */
+    if ((get_state() != STATE_DATARCVD) && (get_state() != STATE_CONNECTED)) {
       printf("Device is not connected\n");
       return -1;
     }
@@ -483,14 +505,11 @@ static int cmd_char_write(gpointer user_data, const char *handle, const char* da
       return -3;
     }
 
-    printf("handle = %d, len = %d\n", hdl, (int)len);
-
-    if (type == WRITE_REQUEST)
+    if (type == WRITE_REQUEST) {
       ret = gatt_write_char(attrib, hdl, value, len, NULL, NULL);
-    else if (type == WRITE_COMMAND)
+    } else if (type == WRITE_COMMAND) {
       ret = gatt_write_cmd(attrib, hdl, value, len, NULL, NULL);
-
-    printf("return value = %d\n", ret);
+    }
 
     g_free(value);
 
@@ -554,9 +573,20 @@ static int cmd_change_notify(gpointer user_data, const char *handle, const char 
   GAttrib *attrib = user_data;
   int ret = 0;
 
-  printf("Now enabling the CCC on the handle %s\n", handle);
-  if (ret = cmd_char_write(attrib, handle, value, WRITE_REQUEST) < 0)
+  if (ret = cmd_char_write(attrib, handle, value, WRITE_COMMAND) < 0)
     printf("Setting the notification enable failed %d\n", ret);
+  return ret;
+}
+
+static int cmd_write_val(gpointer user_data, const char *handle, const char *value)
+{
+  GAttrib *attrib = user_data;
+  int ret = 0, hdl;
+
+  printf("Now writing value [%s] to handle %s\n", value, handle);
+  if (ret = cmd_char_write(attrib, handle, value, WRITE_REQUEST) < 0)
+    printf("Writing value for handle %s failed\n", handle);
+
   return ret;
 }
 
@@ -582,8 +612,8 @@ static int cmd_set_sec_level(char *level)
   else if (strcasecmp(level, "high") == 0)
     sec_level = BT_IO_SEC_HIGH;
   else {
-      printf("Invalid security level\n");
-      return -1;
+    printf("Invalid security level\n");
+    return -1;
   }
 
   if (get_state() != STATE_CONNECTED) {
@@ -606,33 +636,27 @@ static int cmd_set_sec_level(char *level)
  * CCC handles below
  */
 static const char *hdl_tbl[] = {
-  "0x0004",     /* service changed */
-  "0x000d",     /* battery level */
   "0x00d3",     /* HID report 1 - keyboard */
   "0x00d7",     /* HID report 2 - pointer */
+  "0x0004",     /* service changed */
+  "0x000d",     /* battery level */
   "0x0020",     /* scan refresh */
   "0x0024",     /* OTA control */
   "0x002e",     /* pose6D */
   "0x0031",     /* position 2d */
   "0x0034",     /* button state */
   "0x0037",     /* gestures */
+  "0x003a",     /* motion 6d */
   "0x003e",     /* nControl */
 };
 
-static const int hid_indexes[] = {2, 3};
-static const int os_indexes[] = {6, 7, 8, 9, 10};
-static const int ota_indexes[] = {5};
-static const int bt_indexes[] = {0, 1, 4};
+static int all_indexes[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
 
-static inline int get_size(const int notify_array[])
-{
-  return (sizeof(notify_array)/sizeof(notify_array[0]));
-}
-
-static void control_service(const int notify_array[], const int size, const char *type)
+static void control_service(const int *notify_array, const int size, const char *type)
 {
   int i, ret;
-  for (i = 0; i <= size; i++) {
+
+  for (i = 0; i < size; i++) {
     if (ret = cmd_change_notify((gpointer)attrib, hdl_tbl[notify_array[i]], type) < 0) {
       printf("Failed to set notification for handle %s\n", hdl_tbl[notify_array[i]]);
       break;
@@ -646,22 +670,33 @@ static void control_service(const int notify_array[], const int size, const char
   }
   if (ret) {
     printf("Failed in reading/writing notification value. Quitting\n");
-    exit(-4);
   }
   return;
 }
 
-/* Some notifications(esp open spatial can remain enabled from the
- * previous run. Its better to disable all of them before starting
- * the current test
- */
-static void disable_notifys()
+#define NCONTROL_HDL  "0x003d"
+
+static void change_mode(gpointer data, int mode)
 {
-  control_service(hid_indexes, get_size(hid_indexes), DISABLE_NOTIFICATION);
-  control_service(os_indexes, get_size(os_indexes), DISABLE_NOTIFICATION);
-  //control_service(ota_indexes, get_size(ota_indexes), DISABLE_NOTIFICATION);
-  control_service(bt_indexes, get_size(bt_indexes), DISABLE_NOTIFICATION);
-  return;
+  switch (mode) {
+    case TTM_MODE:
+      cmd_write_val(data, NCONTROL_HDL, "0c00");
+      break;
+    case GAME_MODE:
+      cmd_write_val(data, NCONTROL_HDL, "0c01");
+      break;
+    case POSE6D_MODE:
+      cmd_write_val(data, NCONTROL_HDL, "0c02");
+      break;
+    case POINTER_MODE:
+      cmd_write_val(data, NCONTROL_HDL, "0c03");
+      break;
+  }
+#if 0
+  /* verify if the mode change was successful */
+  if (cmd_read_char((gpointer)data, NCONTROL_HDL) < 0)
+    printf("Reading the mode value failed!\n");
+#endif
 }
 
 int main(int argc, char **argv)
@@ -669,6 +704,7 @@ int main(int argc, char **argv)
   char addr[18];
   char *handle, *value;
   int ret, choice;
+
   printf("*********************************\n");
   printf("**** Nod Labs test framework ****\n");
   printf("*********************************\n");
@@ -676,8 +712,9 @@ int main(int argc, char **argv)
   /* initialize a glib event loop */
   event_loop = g_main_loop_new(NULL, FALSE);
 
-  printf("Scanning all BTLE devices in proximity...");
+  printf("Scanning BTLE devices in proximity...");
   printf("Press ^C to stop scanning\n");
+
   if(ret = cmd_lescan(0) < 0) {
     printf("Scanning failed!! Quitting %d\n", ret);
     exit(-1);
@@ -686,57 +723,56 @@ int main(int argc, char **argv)
   printf("Enter the device to connect: ");
   scanf("%s", addr);
 
-  printf("Attempting to connect to [%s]\n", addr);
   ret = 0;
   if (ret = cmd_connect(addr, NULL) < 0) {
     printf("Connection failed %d\n", ret);
     exit(-2);
+  } else {
+    printf("Connected to [%s]\n", addr);
   }
 
-  /* IMP: If the native bluez stack is running while this test runs, then the
-   * keys get cached in the system(on which this is running). Next time this
-   * test case is being run, it will fail to change the security level to
-   * anything other than "low". To resolve this issue, we need to check for
-   * the paired devices in bluetoothctl (command is show devices) and remove
-   * the device for which this test case is being run
-   */
-  printf("setting the security level to %s\n", SEC_LEVEL);
-  printf("The device [%s] is now connected\n", addr);
-  ret = 0;
-  if (ret = cmd_set_sec_level(SEC_LEVEL) < 0) {
-    printf("Setting security level failed %d\n", ret);
-    exit(-3);
-  }
-  printf("Now discovering all available services\n");
+  printf("========= SERVICES ==========\n");
   discover_services((gpointer)attrib);
 
-  printf("Now discovering all available characteristics\n");
+  printf("\n\n =========== CHARACTERISTICS ========== \n");
   discover_characteristics((gpointer)attrib, CHAR_START, CHAR_END);
 
-  disable_notifys();
+  /* IMP: If the native bluez stack is running while this test runs, then the
+   * keys get cached in the system(on which this is running). Next time, when this
+   * test case is being run, it will fail to change the security level to
+   * anything other than "low". To resolve this issue, we need to check for
+   * the paired devices in bluetoothctl (using cmd 'show devices') and remove
+   * the device's information.
+   */
+  if (cmd_set_sec_level("high") < 0) {
+    printf("Failed to set the security level to HIGH\n");
+    exit(-1);
+  } else {
+    printf("Security level set to HIGH\n");
+  }
+
+  /* Now, enable all notifications for the ring */
+  control_service(all_indexes, GET_SZ(all_indexes), ENABLE_NOTIFICATION);
+
+  /*
+   * TODO: Make sure the below mode list is up-to-date with
+   * the numbers used in the f/w
+   */
 
   ret = 0;
-  printf("Which service notifications you want to enable?\n");
-  printf("1. HID over GATT\n");
-  printf("2. Open spatial\n");
-  //printf("3. DFU OTA\n");
-  printf("4. Other standard services\n");
+  printf("Which mode you want to enable?\n");
+  printf("0. TTM\n");
+  printf("1. Gamepad\n");
+  printf("2. Pose6D\n");
+  printf("3. Free pointer\n");
   printf("Enter your choice: ");
   scanf("%d", &choice);
+
   printf("\n");
-  switch(choice) {
-    case 1: control_service(hid_indexes, get_size(hid_indexes), ENABLE_NOTIFICATION);
-            break;
-    case 2: control_service(os_indexes, get_size(os_indexes), ENABLE_NOTIFICATION);
-            break;
-    //case 3: control_service(ota_indexes, get_size(ota_indexes), ENABLE_NOTIFICATION);
-    //        break;
-    case 4: control_service(bt_indexes, get_size(bt_indexes), ENABLE_NOTIFICATION);
-            break;
-    default: printf("Invalid choice. Enbling HID as default\n");
-            control_service(hid_indexes, get_size(hid_indexes), ENABLE_NOTIFICATION);
-            break;
-  }
+
+  /* update the mode accordingly */
+  change_mode((gpointer)attrib, choice);
+
   /* We have an active connection with data ready to be received now */
   set_state(STATE_CONNACTIVE);
 
@@ -747,7 +783,7 @@ int main(int argc, char **argv)
   cmd_disconnect();
 
   /* un-initialize glib event loop */
-  g_main_loop_unref(event_loop);  
+  g_main_loop_unref(event_loop);
 
   return 0;
 }
