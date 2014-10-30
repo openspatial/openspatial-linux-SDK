@@ -1,0 +1,13 @@
+The build system has been based on Ankidrive's opensource SDK code
+available at: https://github.com/anki/drive-sdk
+
+Instructions to build the test-bench:
+
+a) to build bluez and test-bench
+
+mkdir build && cd build
+cmake .. -DBUILD_FRAMEWORK=ON
+make
+make install
+
+build/dist/bin has build artifacts
