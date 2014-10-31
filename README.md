@@ -59,6 +59,6 @@ Setting the notification enable failed 1
 Device is not connected
 Failed in reading/writing notification value. Quitting
 - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-Solution: Kill the process and restart
+Solution: Kill the process and
           restart the hardware as well
 ***************************************************************************
